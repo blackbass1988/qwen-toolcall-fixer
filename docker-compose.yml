@@ -1,0 +1,25 @@
+services:
+  qwen-toolcall-fixer:
+    build: .
+    container_name: qwen-toolcall-fixer
+    restart: unless-stopped
+    ports:
+      - "4001:4001"
+    environment:
+      # Point to your LiteLLM instance
+      LITELLM_BASE_URL: "${LITELLM_BASE_URL:-http://host.docker.internal:4000}"
+      MIDDLEWARE_PORT: "4001"
+      REQUEST_TIMEOUT: "600"
+      LOG_LEVEL: "INFO"
+      # Strip reasoning_content from assistant messages in conversation history
+      # to save context window. Set to "false" to disable.
+      STRIP_REASONING_HISTORY: "${STRIP_REASONING_HISTORY:-true}"
+      # Emit a synthetic noop bash tool call when the model produces orphaned
+      # parameter fragments that can't be recovered into a real tool call.
+      # Keeps the agent loop alive so the model can self-correct. Default: false.
+      EMIT_NOOP_ON_ORPHAN: "${EMIT_NOOP_ON_ORPHAN:-false}"
+    # If LiteLLM runs on the same Docker network:
+    # networks:
+    #   - litellm-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
