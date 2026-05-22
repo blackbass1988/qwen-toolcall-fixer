@@ -385,7 +385,8 @@ class TestFixCompletionResponse:
         # Empty array should become None
         assert msg["tool_calls"] is None
         # Whitespace-only content should become ""
-        assert msg["content"] == ""
+        # Newlines (\n) are preserved because they are meaningful formatting
+        assert msg["content"] == "\n\n"
 
     def test_normalize_does_not_touch_valid_tool_calls(self):
         """Non-empty tool_calls array should pass through untouched"""

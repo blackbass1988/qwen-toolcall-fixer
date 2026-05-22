@@ -352,9 +352,9 @@ def _normalize_message(message: dict) -> bool:
         changed = True
         logger.debug("Normalized empty tool_calls [] → null")
 
-    # Whitespace-only content → ""
+    # Whitespace-only content (spaces/tabs, NOT newlines) → ""
     content = message.get("content")
-    if isinstance(content, str) and content != "" and content.strip() == "":
+    if isinstance(content, str) and content != "" and content.strip() == "" and "\n" not in content:
         message["content"] = ""
         changed = True
         logger.debug("Normalized whitespace-only content → empty string")
@@ -368,7 +368,8 @@ def _normalize_streaming_chunk(chunk: dict) -> None:
 
     Fixes the same issues as _normalize_message but on delta objects:
     - ``tool_calls: []`` in delta → remove key
-    - whitespace-only ``content`` in delta → ``""``
+    - whitespace-only ``content`` in delta (spaces/tabs only, NOT newlines)
+         → ``""``
     """
     for choice in chunk.get("choices", []):
         delta = choice.get("delta", {})
@@ -378,7 +379,9 @@ def _normalize_streaming_chunk(chunk: dict) -> None:
             del delta["tool_calls"]
 
         content = delta.get("content")
-        if isinstance(content, str) and content != "" and content.strip() == "":
+        # Strip pure whitespace (spaces/tabs) but PRESERVE newlines (\n is meaningful
+        # in markdown tables, code blocks, etc.  "\n".strip() == "" would eat them).
+        if isinstance(content, str) and content != "" and content.strip() == "" and "\n" not in content:
             delta["content"] = ""
 
 
@@ -396,7 +399,7 @@ def fix_completion_response(data: dict) -> tuple[dict, bool]:
         if _normalize_message(message):
             fixed = True
 
-        reasoning = message.get("reasoning_content") or ""
+        reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
 
         has_hint = HAS_TOOL_CALL_HINT.search(reasoning) if reasoning else None
         has_orphan = HAS_ORPHAN_PARAM_HINT.search(reasoning) if reasoning else None
@@ -442,6 +445,8 @@ def _rebuild_streaming_chunks(
     lines: list[str] = []
 
     def _chunk(delta: dict, finish: Optional[str] = None) -> str:
+        # Compact JSON: newlines inside string values stay escaped as \n,
+        # no extra spaces, single-line output so SSE parser handles it correctly.
         return json.dumps(
             {
                 "id": base_id,
@@ -455,7 +460,9 @@ def _rebuild_streaming_chunks(
                         "finish_reason": finish,
                     }
                 ],
-            }
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
 
     # Role chunk
@@ -522,7 +529,7 @@ async def chat_completions(request: Request):
         return await _handle_non_streaming(body, fwd_headers)
 
 
-async def _handle_non_streaming(body: dict, headers: dict) -> JSONResponse:
+async def _handle_non_streaming(body: dict, headers: dict) -> Response:
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         upstream = await client.post(
             f"{LITELLM_BASE_URL}/v1/chat/completions",
@@ -533,7 +540,12 @@ async def _handle_non_streaming(body: dict, headers: dict) -> JSONResponse:
     data, was_fixed = fix_completion_response(data)
     if was_fixed:
         logger.debug("Non-streaming response fixed: %s", data.get("id"))
-    return JSONResponse(content=data, status_code=upstream.status_code)
+    # Use compact JSON (no indentation) so newlines inside strings stay as \n
+    return Response(
+        content=json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+        media_type="application/json",
+        status_code=upstream.status_code,
+    )
 
 
 async def _handle_streaming(body: dict, headers: dict) -> StreamingResponse:
@@ -584,7 +596,7 @@ async def _handle_streaming(body: dict, headers: dict) -> StreamingResponse:
                 base_created = chunk.get("created", 0)
             for choice in chunk.get("choices", []):
                 delta = choice.get("delta", {})
-                rc = delta.get("reasoning_content")
+                rc = delta.get("reasoning_content") or delta.get("reasoning")
                 if rc:
                     full_reasoning += rc
                 ct = delta.get("content")
@@ -652,9 +664,21 @@ async def _handle_streaming(body: dict, headers: dict) -> StreamingResponse:
 # --------------- pass-through for all other endpoints ---------------
 
 
+_HOP_BY_HOP_HEADERS = frozenset({
+    "connection", "keep-alive", "transfer-encoding",
+    "upgrade", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "expect",
+})
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_passthrough(request: Request, path: str):
-    """Transparently proxy everything else (models, embeddings, etc.) to LiteLLM."""
+    """
+    Transparently proxy everything else (models, embeddings, docs, etc.) to LiteLLM.
+
+    Returns the upstream response with hop-by-hop headers stripped so the
+    transfer-encoding / content-length conflict can't corrupt the body.
+    """
     fwd_headers = {
         k: v
         for k, v in request.headers.items()
@@ -670,10 +694,17 @@ async def proxy_passthrough(request: Request, path: str):
             content=body,
         )
 
+    # Strip hop-by-hop headers that would corrupt the response body
+    # (e.g. transfer-encoding: chunked conflicts with our raw bytes payload)
+    clean_headers = {
+        k: v for k, v in resp.headers.items()
+        if k.lower() not in _HOP_BY_HOP_HEADERS
+    }
+
     return Response(
         content=resp.content,
         status_code=resp.status_code,
-        headers=dict(resp.headers),
+        headers=clean_headers,
     )
 
 
