@@ -33,6 +33,7 @@ LISTEN_PORT = int(os.environ.get("MIDDLEWARE_PORT", "4001"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "600"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 STRIP_REASONING_HISTORY = os.environ.get("STRIP_REASONING_HISTORY", "true").lower() in ("true", "1", "yes")
+RENAME_REASONING_HISTORY = os.environ.get("RENAME_REASONING_HISTORY", "false").lower() in ("true", "1", "yes")
 EMIT_NOOP_ON_ORPHAN = os.environ.get("EMIT_NOOP_ON_ORPHAN", "false").lower() in ("true", "1", "yes")
 
 logging.basicConfig(
@@ -296,7 +297,7 @@ def extract_tool_calls_from_text(text: str) -> tuple[str, list[dict]]:
 
 
 # ---------------------------------------------------------------------------
-# Request preprocessor – strip reasoning_content from conversation history
+# Request preprocessor – handle reasoning_content in conversation history
 # ---------------------------------------------------------------------------
 
 
@@ -317,6 +318,26 @@ def strip_reasoning_from_history(body: dict) -> int:
     if stripped:
         logger.info("Stripped reasoning_content from %d assistant message(s)", stripped)
     return stripped
+
+
+def rename_reasoning_in_history(body: dict) -> int:
+    """
+    Rename ``reasoning_content`` to ``reasoning`` on assistant messages in the
+    request history. This keeps prior assistant reasoning visible to upstreams
+    that expect the ``reasoning`` field name instead of ``reasoning_content``.
+    If an assistant message already has ``reasoning``, it is left unchanged.
+
+    Returns the number of messages that were renamed.
+    """
+    renamed = 0
+    for msg in body.get("messages", []):
+        if msg.get("role") == "assistant" and "reasoning_content" in msg and "reasoning" not in msg:
+            msg["reasoning"] = msg["reasoning_content"]
+            del msg["reasoning_content"]
+            renamed += 1
+    if renamed:
+        logger.info("Renamed reasoning_content to reasoning in %d assistant message(s)", renamed)
+    return renamed
 
 
 # ---------------------------------------------------------------------------
@@ -512,8 +533,10 @@ async def chat_completions(request: Request):
     body = await request.json()
     is_stream = body.get("stream", False)
 
-    # Strip reasoning_content from conversation history to save context window
-    if STRIP_REASONING_HISTORY:
+    # Rename takes precedence so assistant reasoning is preserved when requested.
+    if RENAME_REASONING_HISTORY:
+        rename_reasoning_in_history(body)
+    elif STRIP_REASONING_HISTORY:
         strip_reasoning_from_history(body)
 
     # Forward headers (auth etc.) but drop hop-by-hop

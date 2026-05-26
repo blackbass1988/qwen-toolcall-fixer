@@ -14,6 +14,9 @@ services:
       # Strip reasoning_content from assistant messages in conversation history
       # to save context window. Set to "false" to disable.
       STRIP_REASONING_HISTORY: "${STRIP_REASONING_HISTORY:-true}"
+      # Rename assistant reasoning_content to reasoning before forwarding upstream.
+      # Takes precedence over STRIP_REASONING_HISTORY when true.
+      RENAME_REASONING_HISTORY: "${RENAME_REASONING_HISTORY:-false}"
       # Emit a synthetic noop bash tool call when the model produces orphaned
       # parameter fragments that can't be recovered into a real tool call.
       # Keeps the agent loop alive so the model can self-correct. Default: false.

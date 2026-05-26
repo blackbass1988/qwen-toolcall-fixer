@@ -30,6 +30,7 @@ Qwen3.5 on vLLM (and other backends) intermittently produces broken tool-call re
 | **Tool-call extraction** | Always on | Two-tier parser (strict + fuzzy) moves tool calls from `reasoning_content` to `tool_calls` |
 | **Response normalization** | Always on | Cleans `tool_calls: []` to `null`, whitespace-only content to `""` |
 | **Strip reasoning history** | `true` | Removes `reasoning_content` from assistant messages in request history to save context window |
+| **Rename reasoning history** | `false` | Renames assistant `reasoning_content` to `reasoning` before forwarding upstream |
 | **Noop fallback** | `false` | Emits synthetic bash tool call on unrecoverable responses to keep the agent loop alive |
 
 ## Architecture
@@ -128,6 +129,7 @@ All via environment variables:
 | `REQUEST_TIMEOUT` | `600` | Upstream request timeout in seconds |
 | `LOG_LEVEL` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 | `STRIP_REASONING_HISTORY` | `true` | Strip `reasoning_content` from assistant messages in request history to save context window. Set to `false` to disable |
+| `RENAME_REASONING_HISTORY` | `false` | Rename assistant `reasoning_content` to `reasoning` before forwarding upstream. When enabled, this takes precedence over stripping |
 | `EMIT_NOOP_ON_ORPHAN` | `false` | Emit synthetic bash noop tool call when model produces reasoning-only responses or unrecoverable fragments. Keeps agent loop alive. Set to `true` to enable |
 
 ## Client Configuration
@@ -222,7 +224,7 @@ pip install -r requirements.txt
 python -m pytest test_extraction.py -v
 ```
 
-35 tests covering all known malformation patterns, normalization, history stripping, and noop emission.
+59 tests covering all known malformation patterns, normalization, history stripping/renaming, and noop emission.
 
 ## Pass-through
 

@@ -9,6 +9,7 @@ import middleware
 from middleware import (
     extract_tool_calls_from_text,
     fix_completion_response,
+    rename_reasoning_in_history,
     strip_reasoning_from_history,
     _normalize_message,
 )
@@ -623,6 +624,54 @@ class TestStripReasoningHistory:
         assert "reasoning_content" not in msg
         assert msg["content"] == "Let me run that."
         assert len(msg["tool_calls"]) == 1
+
+
+class TestRenameReasoningHistory:
+    def test_renames_reasoning_content_on_assistant_messages(self):
+        body = {
+            "messages": [
+                {"role": "system", "content": "System prompt"},
+                {
+                    "role": "assistant",
+                    "content": "Hello!",
+                    "reasoning_content": "User greeted me.",
+                },
+                {"role": "user", "content": "Next request"},
+                {
+                    "role": "assistant",
+                    "content": "Let me check.",
+                    "reasoning_content": "Need to inspect the file.",
+                },
+            ],
+        }
+
+        count = rename_reasoning_in_history(body)
+
+        assert count == 2
+        assert "reasoning_content" not in body["messages"][1]
+        assert body["messages"][1]["reasoning"] == "User greeted me."
+        assert "reasoning_content" not in body["messages"][3]
+        assert body["messages"][3]["reasoning"] == "Need to inspect the file."
+        assert "reasoning" not in body["messages"][0]
+        assert "reasoning" not in body["messages"][2]
+
+    def test_does_not_touch_assistant_message_that_already_has_reasoning(self):
+        body = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "Done.",
+                    "reasoning": "Existing reasoning.",
+                    "reasoning_content": "Alternate reasoning.",
+                },
+            ],
+        }
+
+        count = rename_reasoning_in_history(body)
+
+        assert count == 0
+        assert body["messages"][0]["reasoning"] == "Existing reasoning."
+        assert body["messages"][0]["reasoning_content"] == "Alternate reasoning."
 
 
 if __name__ == "__main__":
