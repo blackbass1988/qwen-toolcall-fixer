@@ -21,9 +21,83 @@ import logging
 import time
 from typing import Optional
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
+
+VLLM_ERROR_TYPES = ()
+try:
+    from vllm.exceptions import VLLMValidationError
+    VLLM_ERROR_TYPES = (VLLMValidationError,)
+except ImportError:
+    pass
+try:
+    from litellm.exceptions import (
+        BadRequestError,
+        ContextWindowExceededError,
+        ExceptionType,
+    )
+    _LITELM_ERROR_TYPES = (
+        BadRequestError,
+        ContextWindowExceededError,
+    )
+except ImportError:
+    _LITELM_ERROR_TYPES = ()
+
+
+def _is_context_length_error(exc: BaseException) -> bool:
+    """Return True if exc is a context length exceeded validation error."""
+    msg = str(exc).lower()
+    if VLLM_ERROR_TYPES and isinstance(exc, VLLM_ERROR_TYPES):
+        return True
+    if _LITELM_ERROR_TYPES and isinstance(exc, _LITELM_ERROR_TYPES):
+        return True
+    if "maximum context length" in msg or "context_length_exceeded" in msg or "exceed" in msg:
+        return True
+    return False
+
+
+def _is_context_length_message(msg: str) -> bool:
+    """Return True if the error message indicates a context-length problem."""
+    lowered = msg.lower()
+    return (
+        "maximum context length" in lowered
+        or "context_length_exceeded" in lowered
+        or "context window" in lowered
+        or ("exceed" in lowered and "token" in lowered)
+    )
+
+
+def _normalize_upstream_error(error_payload: dict) -> dict:
+    """
+    Convert upstream context-length errors into the standard OpenAI shape.
+
+    vLLM / LiteLLM sometimes emit:
+        type: "BadRequestError", code: 400
+    OpenCode (and other clients) expect:
+        type: "context_length_exceeded", code: "context_length_exceeded"
+    """
+    if not isinstance(error_payload, dict):
+        return error_payload
+
+    msg = error_payload.get("message", "")
+    if _is_context_length_message(msg):
+        error_payload = dict(error_payload)  # shallow copy
+        error_payload["type"] = "context_length_exceeded"
+        error_payload["code"] = "context_length_exceeded"
+        error_payload.setdefault("param", "messages")
+    return error_payload
+
+
+def _error_body_from_exc(exc: BaseException) -> str:
+    """Extract a human-readable error message from an exception."""
+    detail = str(exc)
+    if not detail:
+        detail = type(exc).__name__
+    if VLLM_ERROR_TYPES and isinstance(exc, VLLM_ERROR_TYPES):
+        return detail
+    return detail
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -519,6 +593,24 @@ app = FastAPI(
 )
 
 
+@app.exception_handler(Exception)
+async def catch_upstream_errors(request: Request, exc: BaseException):
+    if _is_context_length_error(exc):
+        logger.warning("Context length error: %s", _error_body_from_exc(exc))
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": _error_body_from_exc(exc),
+                    "type": "context_length_exceeded",
+                    "param": None,
+                    "code": "context_length_exceeded",
+                }
+            },
+        )
+    raise
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "upstream": LITELLM_BASE_URL}
@@ -559,7 +651,32 @@ async def _handle_non_streaming(body: dict, headers: dict) -> Response:
             json=body,
             headers=headers,
         )
+
+    # Handle error responses from upstream (including wrapped vLLM errors)
+    if upstream.status_code >= 400:
+        data = upstream.json()
+        raw_err = data.get("error", {}) if isinstance(data, dict) else {}
+        error_msg = raw_err.get("message", upstream.text) if isinstance(raw_err, dict) else upstream.text
+        logger.warning("Upstream returned %d: %s", upstream.status_code, error_msg)
+        normalized_err = _normalize_upstream_error(raw_err) if isinstance(raw_err, dict) else {"message": error_msg}
+        return JSONResponse(
+            status_code=upstream.status_code,
+            content={"error": normalized_err},
+        )
+
     data = upstream.json()
+
+    # Also check for error responses embedded in 200 OK body (LiteLLM wrapping vLLM)
+    if isinstance(data, dict) and "error" in data:
+        err = data["error"]
+        error_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+        logger.warning("Upstream returned 200 with error in body: %s", error_msg)
+        normalized_err = _normalize_upstream_error(err) if isinstance(err, dict) else {"message": error_msg}
+        return JSONResponse(
+            status_code=400,
+            content={"error": normalized_err},
+        )
+
     data, was_fixed = fix_completion_response(data)
     if was_fixed:
         logger.debug("Non-streaming response fixed: %s", data.get("id"))
@@ -591,6 +708,28 @@ async def _handle_streaming(body: dict, headers: dict) -> StreamingResponse:
                 json=body,
                 headers=headers,
             ) as resp:
+                if resp.status_code >= 400:
+                    error_text = await resp.aread()
+                    error_msg = error_text.decode() if error_text else "Upstream error"
+                    logger.warning("Upstream streaming returned %d: %s", resp.status_code, error_msg)
+                    # Try to parse upstream JSON error; fall back to plain text
+                    try:
+                        err_data = json.loads(error_msg)
+                        raw_err = err_data.get("error", {}) if isinstance(err_data, dict) else {}
+                        if isinstance(raw_err, dict):
+                            normalized_err = _normalize_upstream_error(raw_err)
+                        else:
+                            normalized_err = {"message": str(raw_err), "type": "upstream_error", "code": "upstream_error"}
+                    except (json.JSONDecodeError, ValueError):
+                        normalized_err = {"message": error_msg, "type": "upstream_error", "code": "upstream_error"}
+                        if _is_context_length_message(error_msg):
+                            normalized_err["type"] = "context_length_exceeded"
+                            normalized_err["code"] = "context_length_exceeded"
+                            normalized_err.setdefault("param", "messages")
+                    yield f"data: {json.dumps({'error': normalized_err})}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
                 async for line in resp.aiter_lines():
                     line = line.strip()
                     if not line:
